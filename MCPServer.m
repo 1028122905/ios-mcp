@@ -11,6 +11,7 @@
 #import "OCRManager.h"
 #import "MCPOCRRequestContext.h"
 #import "MCPLogger.h"
+#import "LocationManager.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -525,6 +526,7 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"list_apps",
             @"list_running_apps",
             @"get_device_info",
+            @"get_location",
             @"get_clipboard",
             @"get_brightness",
             @"get_volume",
@@ -765,6 +767,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeDragAndDrop:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeOpenURL:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetDeviceInfo:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetLocation:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeRunCommand:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetBrightness:(id)reqId;
 - (NSDictionary *)executeSetBrightness:(id)reqId args:(NSDictionary *)args;
@@ -2447,6 +2450,22 @@ static NSString *MCPLogId(id reqId) {
                 }
             }
         },
+        @{
+            @"name": @"get_location",
+            @"description": @"Get current device GPS and network location (latitude, longitude, altitude, accuracy, speed, course, timestamp).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional effective bundle identifier to use for location authorization (auto-discovers authorized system/user apps when omitted)"},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds to acquire location fix (default: 10.0, min: 1.0, max: 60.0)"},
+                    @"desired_accuracy": @{
+                        @"type": @"string",
+                        @"enum": @[@"hundred_meters", @"best", @"ten_meters", @"kilometer"],
+                        @"description": @"Desired accuracy level (default: hundred_meters)"
+                    }
+                }
+            }
+        },
         // ---- Shell command tools ----
         @{
             @"name": @"run_command",
@@ -2726,6 +2745,8 @@ static NSString *MCPLogId(id reqId) {
     // Device info tools
     else if ([toolName isEqualToString:@"get_device_info"]) {
         return [self executeGetDeviceInfo:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_location"]) {
+        return [self executeGetLocation:reqId args:args];
     }
     // Shell command tools
     else if ([toolName isEqualToString:@"run_command"]) {
@@ -4058,6 +4079,64 @@ static NSString *MCPLogId(id reqId) {
         return [self mcpSuccess:reqId structuredContent:info];
     }
     return [self mcpSuccess:reqId text:@"Failed to get device info" isError:YES];
+}
+
+- (NSDictionary *)executeGetLocation:(id)reqId args:(NSDictionary *)args {
+    NSTimeInterval timeout = 10.0;
+    if (args[@"timeout"] && [args[@"timeout"] respondsToSelector:@selector(doubleValue)]) {
+        timeout = [args[@"timeout"] doubleValue];
+    }
+    if (timeout <= 0) timeout = 10.0;
+    if (timeout > 60.0) timeout = 60.0;
+
+    CLLocationAccuracy accuracy = kCLLocationAccuracyHundredMeters;
+    NSString *accStr = args[@"desired_accuracy"];
+    if ([accStr isKindOfClass:[NSString class]]) {
+        if ([accStr isEqualToString:@"best"]) {
+            accuracy = kCLLocationAccuracyBest;
+        } else if ([accStr isEqualToString:@"ten_meters"] || [accStr isEqualToString:@"nearest_ten_meters"]) {
+            accuracy = kCLLocationAccuracyNearestTenMeters;
+        } else if ([accStr isEqualToString:@"hundred_meters"]) {
+            accuracy = kCLLocationAccuracyHundredMeters;
+        } else if ([accStr isEqualToString:@"kilometer"]) {
+            accuracy = kCLLocationAccuracyKilometer;
+        }
+    }
+
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    __block NSDictionary *locInfo = nil;
+    __block NSString *errMsg = nil;
+    __block BOOL isDone = NO;
+
+    NSString *bundleId = args[@"bundle_id"];
+    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+        bundleId = nil;
+    }
+
+    [[LocationManager sharedManager] getCurrentLocationWithBundleId:bundleId
+                                                            timeout:timeout
+                                                    desiredAccuracy:accuracy
+                                                         completion:^(NSDictionary * _Nullable locationInfo, NSString * _Nullable errorMessage) {
+        locInfo = locationInfo;
+        errMsg = errorMessage;
+        isDone = YES;
+        dispatch_semaphore_signal(sema);
+    }];
+
+    if ([NSThread isMainThread]) {
+        CFTimeInterval deadline = CFAbsoluteTimeGetCurrent() + timeout + 1.5;
+        while (!isDone && CFAbsoluteTimeGetCurrent() < deadline) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        }
+    } else {
+        dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 1.5) * NSEC_PER_SEC)));
+    }
+
+    if (locInfo) {
+        return [self mcpSuccess:reqId structuredContent:locInfo];
+    } else {
+        return [self mcpSuccess:reqId text:errMsg ?: @"Failed to obtain location fix." isError:YES];
+    }
 }
 
 #pragma mark - Shell Command Execution

@@ -73,7 +73,8 @@ NSString *MCPInterfaceOrientationName(UIInterfaceOrientation orientation) {
 static CGSize MCPPointSizeForPixelSize(CGSize pixelSize) {
     if (pixelSize.width < 1.0 || pixelSize.height < 1.0) return CGSizeZero;
 
-    CGSize screenSize = [UIScreen mainScreen].fixedCoordinateSpace.bounds.size;
+    // Use current bounds according to interface orientation
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
     CGFloat pointLongEdge = MAX(screenSize.width, screenSize.height);
     if (pointLongEdge < 1.0) return CGSizeZero;
 
@@ -400,6 +401,20 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     return mutablePayload;
 }
 
+- (UIImage *)normalizedImageFromImage:(UIImage *)image {
+    if (!image || image.imageOrientation == UIImageOrientationUp) return image;
+
+    CGSize size = image.size;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = image.scale > 0 ? image.scale : 1.0;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    UIImage *normalized = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [image drawInRect:CGRectMake(0, 0, size.width, size.height)];
+    }];
+    return normalized ?: image;
+}
+
 - (UIImage *)privateScreenshotImage {
     UIImage *image = [self screenshotImageFromRenderServerCapture];
     if (image) return image;
@@ -424,6 +439,9 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
         image = [self privateScreenshotImage];
         if (!image) {
             image = [self fallbackScreenshotImage];
+        }
+        if (image && image.imageOrientation != UIImageOrientationUp) {
+            image = [self normalizedImageFromImage:image];
         }
     };
     if ([NSThread isMainThread]) {
@@ -599,22 +617,92 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
 - (UIImage *)pointSizedImageFromImage:(UIImage *)image {
     if (!image) return nil;
 
-    CGSize pixelSize = [self pixelSizeForImage:image];
-    CGSize targetSize = MCPPointSizeForPixelSize(pixelSize);
-    if (CGSizeEqualToSize(targetSize, CGSizeZero)) return image;
+    MCPScreenGeometry geom = MCPGetScreenGeometry();
+    UIInterfaceOrientation orientation = geom.interfaceOrientation;
+    if (orientation == 0) orientation = UIInterfaceOrientationPortrait;
+
+    CGSize fixedSize = geom.fixedBounds.size;
+    CGFloat shortEdge = MIN(fixedSize.width, fixedSize.height);
+    CGFloat longEdge = MAX(fixedSize.width, fixedSize.height);
+    if (shortEdge < 1.0 || longEdge < 1.0) {
+        CGSize sb = [UIScreen mainScreen].bounds.size;
+        shortEdge = MIN(sb.width, sb.height);
+        longEdge = MAX(sb.width, sb.height);
+    }
+    if (shortEdge < 1.0 || longEdge < 1.0) return image;
+
+    BOOL isLandscape = UIInterfaceOrientationIsLandscape(orientation);
+    CGSize targetSize = isLandscape ? CGSizeMake(longEdge, shortEdge) : CGSizeMake(shortEdge, longEdge);
+
+    BOOL rawIsLandscape = (image.size.width > image.size.height);
+
+    CGFloat angle = 0;
+    CGFloat tx = 0, ty = 0;
+
+    if (rawIsLandscape) {
+        // Native landscape capture buffer (e.g. iPad mini 6)
+        if (orientation == UIInterfaceOrientationPortrait) {
+            angle = (CGFloat)(-M_PI_2);
+            tx = 0;
+            ty = targetSize.height;
+        } else if (orientation == UIInterfaceOrientationLandscapeLeft) {
+            angle = (CGFloat)(M_PI);
+            tx = targetSize.width;
+            ty = targetSize.height;
+        } else if (orientation == UIInterfaceOrientationLandscapeRight) {
+            angle = 0;
+            tx = 0;
+            ty = 0;
+        } else if (orientation == UIInterfaceOrientationPortraitUpsideDown) {
+            angle = (CGFloat)(M_PI_2);
+            tx = targetSize.width;
+            ty = 0;
+        }
+    } else {
+        // Native portrait capture buffer (e.g. iPhone)
+        if (orientation == UIInterfaceOrientationPortrait) {
+            angle = 0;
+            tx = 0;
+            ty = 0;
+        } else if (orientation == UIInterfaceOrientationLandscapeLeft) {
+            angle = (CGFloat)(-M_PI_2);
+            tx = 0;
+            ty = targetSize.height;
+        } else if (orientation == UIInterfaceOrientationLandscapeRight) {
+            angle = (CGFloat)(M_PI_2);
+            tx = targetSize.width;
+            ty = 0;
+        } else if (orientation == UIInterfaceOrientationPortraitUpsideDown) {
+            angle = (CGFloat)(M_PI);
+            tx = targetSize.width;
+            ty = targetSize.height;
+        }
+    }
 
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
     format.scale = 1.0;
     format.opaque = YES;
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
-    UIImage *pointImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+    UIImage *orientedImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGContextRef c = ctx.CGContext;
+        if (angle != 0) {
+            CGContextTranslateCTM(c, tx, ty);
+            CGContextRotateCTM(c, angle);
+        }
+        if (angle == (CGFloat)(-M_PI_2) || angle == (CGFloat)(M_PI_2)) {
+            [image drawInRect:CGRectMake(0, 0, targetSize.height, targetSize.width)];
+        } else {
+            [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+        }
     }];
-    if (!pointImage) return image;
 
-    SCREEN_LOG(@"Downsampled screenshot %.0fx%.0f px -> %.0fx%.0f pt",
-               pixelSize.width, pixelSize.height, targetSize.width, targetSize.height);
-    return pointImage;
+    if (orientedImage) {
+        SCREEN_LOG(@"Normalized screenshot orientation=%ld %.0fx%.0f -> %.0fx%.0f pt",
+                   (long)orientation, image.size.width, image.size.height, targetSize.width, targetSize.height);
+        return orientedImage;
+    }
+
+    return image;
 }
 
 - (NSData *)JPEGDataForImage:(UIImage *)image maxBytes:(NSUInteger)maxBytes {
